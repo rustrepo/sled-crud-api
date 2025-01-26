@@ -2,9 +2,9 @@ use actix_web::{delete, get, post, put, web, App, HttpResponse, HttpServer, Resp
 use serde::{Deserialize, Serialize};
 use sled::Db;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
-// User data structure
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct User {
     id: String,
@@ -12,16 +12,30 @@ struct User {
     email: String,
 }
 
-// Request structure for creating users (without ID)
 #[derive(Debug, Serialize, Deserialize)]
 struct CreateUserRequest {
     name: String,
     email: String,
 }
 
-// Application state holding our database
 struct AppState {
-    db: Arc<Db>,
+    db: Arc<Mutex<Db>>,
+}
+
+impl AppState {
+    async fn db_operation<F, R>(&self, op: F) -> Result<R, sled::Error>
+    where
+        F: FnOnce(&Db) -> Result<R, sled::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = db.blocking_lock();
+            op(&db)
+        })
+        .await
+        .unwrap()
+    }
 }
 
 #[post("/users")]
@@ -36,7 +50,16 @@ async fn create_user(
         email: user_data.email.clone(),
     };
 
-    match data.db.insert(&id, serde_json::to_vec(&user).unwrap()) {
+    // Clone values for the closure
+    let user_clone = user.clone();
+    let id_clone = id.clone();
+
+    match data
+        .db_operation(move |db| {
+            db.insert(&id_clone, serde_json::to_vec(&user_clone).unwrap())
+        })
+        .await
+    {
         Ok(_) => HttpResponse::Created().json(user),
         Err(_) => HttpResponse::InternalServerError().finish(),
     }
@@ -45,12 +68,18 @@ async fn create_user(
 #[get("/users/{id}")]
 async fn get_user(data: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let id = path.into_inner();
+    
+    // Clone ID for the closure
+    let id_clone = id.clone();
 
-    match data.db.get(&id) {
-        Ok(Some(user)) => {
-            let user: User = serde_json::from_slice(&user).unwrap();
-            HttpResponse::Ok().json(user)
-        }
+    match data
+        .db_operation(move |db| db.get(&id_clone))
+        .await
+    {
+        Ok(Some(user)) => match serde_json::from_slice::<User>(&user) {
+            Ok(user) => HttpResponse::Ok().json(user),
+            Err(_) => HttpResponse::InternalServerError().finish(),
+        },
         Ok(None) => HttpResponse::NotFound().finish(),
         Err(_) => HttpResponse::InternalServerError().finish(),
     }
@@ -69,7 +98,16 @@ async fn update_user(
         email: user_data.email.clone(),
     };
 
-    match data.db.insert(&id, serde_json::to_vec(&user).unwrap()) {
+    // Clone values for the closure
+    let user_clone = user.clone();
+    let id_clone = id.clone();
+
+    match data
+        .db_operation(move |db| {
+            db.insert(&id_clone, serde_json::to_vec(&user_clone).unwrap())
+        })
+        .await
+    {
         Ok(_) => HttpResponse::Ok().json(user),
         Err(_) => HttpResponse::InternalServerError().finish(),
     }
@@ -79,19 +117,27 @@ async fn update_user(
 async fn delete_user(data: web::Data<AppState>, path: web::Path<String>) -> impl Responder {
     let id = path.into_inner();
 
-    match data.db.remove(&id) {
+    // Clone ID for the closure
+    let id_clone = id.clone();
+
+    match data
+        .db_operation(move |db| db.remove(&id_clone))
+        .await
+    {
         Ok(Some(_)) => HttpResponse::NoContent().finish(),
         Ok(None) => HttpResponse::NotFound().finish(),
         Err(_) => HttpResponse::InternalServerError().finish(),
     }
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
-    // Open Sled database
     let db = sled::open("my_db").expect("Failed to open database");
-    let db = Arc::new(db);
+    let db = Arc::new(Mutex::new(db));
 
+    let workers = num_cpus::get() * 2;
+    let port = std::env::var("PORT").unwrap_or("8080".to_string());
+    
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(AppState { db: Arc::clone(&db) }))
@@ -100,7 +146,8 @@ async fn main() -> std::io::Result<()> {
             .service(update_user)
             .service(delete_user)
     })
-    .bind("127.0.0.1:8080")?
+    .workers(workers)
+    .bind(("0.0.0.0", port.parse().unwrap()))?
     .run()
     .await
 }

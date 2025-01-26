@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 actix-web = "4.0"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.137"
 sled = "0.34"
 uuid = { version = "1.0", features = ["v4", "serde"] }
+tokio = { version = "1.0", features = ["full"] }
+num_cpus = "1.13"
+serde_json = "1.0.137"
